@@ -1,0 +1,10 @@
+{
+  "id": "rabby-task-manager",
+  "name": "Task Manager (Rabby)",
+  "version": "3.1.0",
+  "minAppVersion": "1.0.0",
+  "description": "Task manager with stable block-ID identity, atomic writes, quick-add parsing and undo.",
+  "author": "Sk Fazla Rabby",
+  "authorUrl": "https://github.com/rabby0101",
+  "isDesktopOnly": false
+}
