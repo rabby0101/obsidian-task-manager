@@ -1,9 +1,9 @@
 {
   "id": "rabby-task-manager",
   "name": "Task Manager (Rabby)",
-  "version": "3.1.0",
+  "version": "4.0.0",
   "minAppVersion": "1.0.0",
-  "description": "Task manager with stable block-ID identity, atomic writes, quick-add parsing and undo.",
+  "description": "Task manager for project notes: projects overview, project pages, due dates, times, time slots and repeating tasks, quick-add parsing and undo.",
   "author": "Sk Fazla Rabby",
   "authorUrl": "https://github.com/rabby0101",
   "isDesktopOnly": false

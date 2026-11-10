@@ -18,7 +18,7 @@
 
 'use strict';
 
-const { ItemView, Plugin, Notice, Menu, setIcon, debounce } = require('obsidian');
+const { ItemView, Plugin, Notice, Menu, Platform, setIcon, debounce } = require('obsidian');
 
 const VIEW_TYPE = 'rabby-task-manager-view';
 const SVG_NS    = 'http://www.w3.org/2000/svg';
@@ -29,8 +29,10 @@ const RE_DUE   = /📅\s*(\d{4}-\d{2}-\d{2})/;
 const RE_MOVES = /↻\s*(\d+)/;
 const RE_FROM  = /\(from\s+(\d{4}-\d{2}-\d{2})\)/;
 const RE_PRIO  = /\((High|Medium|Low)\)/i;
-const RE_TAG   = /🔖\s*([^\s🔖📅(]+)/g;
-const RE_DONE  = /✅\s*\d{4}-\d{2}-\d{2}/;
+const RE_TAG   = /🔖\s*([^\s🔖📅⏰🔁(]+)/g;
+const RE_TIME  = /⏰\s*(\d{1,2}:\d{2})(?:\s*[-–]\s*(\d{1,2}:\d{2}))?/;
+const RE_REPEAT = /🔁\s*every\s+(day|weekday|week|month)\b/i;
+const RE_DONE  = /✅\s*(\d{4}-\d{2}-\d{2})/;
 const RE_H_TASKS   = /^#+\s*Tasks\s*$/i;
 
 const PRIORITIES = ['High', 'Medium', 'Low'];
@@ -44,11 +46,75 @@ const TABS = [
   { id: 'done',      label: 'Done'      },
 ];
 
+const REPEATS = [['', 'Never'], ['day', 'Daily'], ['weekday', 'Weekdays'], ['week', 'Weekly'], ['month', 'Monthly']];
+const REPEAT_LABEL = Object.fromEntries(REPEATS);
+
+/* day view groups, by start time; tasks without a time go to Anytime */
+const DAY_GROUPS = [
+  { id: 'any',       label: 'Anytime',   icon: 'circle-dashed' },
+  { id: 'morning',   label: 'Morning',   icon: 'sunrise',   until: 12 * 60 },
+  { id: 'midday',    label: 'Midday',    icon: 'sun',       until: 14 * 60 },
+  { id: 'afternoon', label: 'Afternoon', icon: 'cloud-sun', until: 18 * 60 },
+  { id: 'evening',   label: 'Evening',   icon: 'moon',      until: 24 * 60 },
+];
+
+/** "9:5" / "09:05" → "09:05"; anything else → "" */
+const normTime = v => {
+  const m = /^(\d{1,2}):(\d{2})$/.exec((v || '').trim());
+  if (!m) return '';
+  const h = +m[1], mi = +m[2];
+  return h < 24 && mi < 60 ? `${String(h).padStart(2, '0')}:${m[2]}` : '';
+};
+const toMin = hm => { const [h, m] = hm.split(':').map(Number); return h * 60 + m; };
+
+/** length of a time slot, e.g. "6h", "1h 30m", "45m" (an end before the start runs past midnight) */
+const slotLength = (a, b) => {
+  let d = toMin(b) - toMin(a);
+  if (d <= 0) d += 24 * 60;
+  const h = Math.floor(d / 60), m = d % 60;
+  return h && m ? `${h}h ${m}m` : h ? `${h}h` : `${m}m`;
+};
+
+function groupOf(t) {
+  if (!t.time) return DAY_GROUPS[0];
+  const m = toMin(t.time);
+  return DAY_GROUPS.find(g => g.until && m < g.until) || DAY_GROUPS[DAY_GROUPS.length - 1];
+}
+
+/** one step of a repeat rule */
+function stepISO(iso, rep) {
+  const d = new Date(iso + 'T00:00');
+  if (rep === 'day') d.setDate(d.getDate() + 1);
+  else if (rep === 'week') d.setDate(d.getDate() + 7);
+  else if (rep === 'weekday') { do d.setDate(d.getDate() + 1); while (d.getDay() === 0 || d.getDay() === 6); }
+  else if (rep === 'month') {
+    const day = d.getDate();
+    d.setDate(1); d.setMonth(d.getMonth() + 1);
+    d.setDate(Math.min(day, new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()));
+  }
+  return d.toLocaleDateString('en-CA');
+}
+
+/** next date for a repeating task: after its due date, and never in the past */
+function nextOccurrence(base, rep) {
+  const today = new Date().toLocaleDateString('en-CA');
+  let n = stepISO(base, rep);
+  for (let guard = 0; n <= today && guard < 1000; guard++) n = stepISO(n, rep);
+  return n;
+}
+
 const STRIP_BACK = 1;    // days of the strip that sit before today
 const STRIP_LEN  = 7;
 
 const todayISO = () => new Date().toLocaleDateString('en-CA');
 const newId    = () => 'tm' + Math.random().toString(36).slice(2, 8);
+
+/** Monday of the week an ISO date falls in */
+const mondayOf = iso => {
+  const d = new Date(iso + 'T00:00');
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  return d.toLocaleDateString('en-CA');
+};
 
 const shiftISO = (iso, n) => {
   const d = new Date(iso + 'T00:00');
@@ -73,6 +139,12 @@ function parseTaskLine(raw) {
   const moves = parseInt((rest.match(RE_MOVES) || [])[1] || '0', 10);
   const from  = (rest.match(RE_FROM) || [])[1] || '';
 
+  const doneOn = (rest.match(RE_DONE) || [])[1] || '';
+  const tmM = rest.match(RE_TIME);
+  const time = tmM ? normTime(tmM[1]) : '';
+  const end  = tmM && tmM[2] && time ? normTime(tmM[2]) : '';
+  const repeat = ((rest.match(RE_REPEAT) || [])[1] || '').toLowerCase();
+
   const tags = [];
   let tm;
   RE_TAG.lastIndex = 0;
@@ -80,6 +152,8 @@ function parseTaskLine(raw) {
 
   const text = rest
     .replace(RE_DUE, '')
+    .replace(RE_TIME, '')
+    .replace(RE_REPEAT, '')
     .replace(RE_MOVES, '')
     .replace(RE_FROM, '')
     .replace(RE_PRIO, '')
@@ -91,7 +165,7 @@ function parseTaskLine(raw) {
   return {
     id, indent,
     done: check.toLowerCase() === 'x',
-    text, due,
+    text, due, time, end, repeat, doneOn,
     priority: prio ? prio[0].toUpperCase() + prio.slice(1).toLowerCase() : '',
     moves, from,
     tags, raw,
@@ -103,10 +177,13 @@ function serialiseTask(t) {
     `${t.indent || ''}- [${t.done ? 'x' : ' '}]`,
     t.text.trim(),
     t.due ? `📅 ${t.due}` : '',
+    t.time ? `⏰ ${t.time}${t.end ? '-' + t.end : ''}` : '',
+    t.repeat ? `🔁 every ${t.repeat}` : '',
     t.moves ? `↻${t.moves}` : '',
     t.moves && t.from ? `(from ${t.from})` : '',
     t.priority ? `(${t.priority})` : '',
     ...t.tags.map(x => `🔖 ${x}`),
+    t.done && t.doneOn ? `✅ ${t.doneOn}` : '',
   ].filter(Boolean);
   return `${bits.join(' ')} ^${t.id}`;
 }
@@ -115,6 +192,7 @@ function serialiseTask(t) {
    as one move, and the very first date is kept as `from`. */
 function trackMove(t, changes) {
   const next = Object.assign({}, t, changes);
+  if (changes && 'done' in changes) next.doneOn = changes.done ? todayISO() : '';
   if (changes && 'due' in changes && t.due && changes.due && changes.due !== t.due) {
     next.moves = (t.moves || 0) + 1;
     next.from = t.from || t.due;
@@ -145,6 +223,10 @@ class TaskView extends ItemView {
     this.query = '';
     this.sort = 'due';
     this.lastDeleted = null;
+    this.project = null;        // path of the project whose page is open
+    this.allProjects = false;   // "See all" in the projects grid
+    this.allDone = false;       // earlier completed tasks on a project page
+    this.weekStart = mondayOf(todayISO());
     this.refresh = debounce(this._refresh.bind(this), 120, true);
   }
 
@@ -165,34 +247,22 @@ class TaskView extends ItemView {
   /* ── static chrome, built once ─────────────────────────────────── */
 
   buildChrome() {
-    /* header: title, date, one-line summary, progress ring */
-    const top  = this.root.createDiv({ cls: 'tm2-top' });
-    const left = top.createDiv({ cls: 'tm2-top-l' });
+    /* two panes: the overview, and one project's page */
+    this.homeEl = this.root.createDiv({ cls: 'tm3-home' });
+    this.pageEl = this.root.createDiv({ cls: 'tm3-page' });
+    this.pageEl.hide();
+    const H = this.homeEl;
 
-    const d = new Date();
-    left.createDiv({ cls: 'tm2-kicker', text: 'Manage tasks' });
-    left.createDiv({ cls: 'tm2-date', text: d.toLocaleDateString(undefined, { day: 'numeric', month: 'long', year: 'numeric' }) });
-    this.subEl = left.createDiv({ cls: 'tm2-sub' });
+    /* header: title · search · sort · month */
+    const hd = H.createDiv({ cls: 'tm3-hd' });
+    const title = hd.createDiv({ cls: 'tm3-hd-t' });
+    setIcon(title.createSpan({ cls: 'tm3-i' }), 'list-checks');
+    title.createSpan({ text: 'Tasks' });
+    const tools = hd.createDiv({ cls: 'tm3-hd-r' });
 
-    this.ringEl = top.createDiv({ cls: 'tm2-ring' });
-
-    /* date strip */
-    this.daysEl = this.root.createDiv({ cls: 'tm2-days' });
-
-    /* toolbar */
-    const bar = this.root.createDiv({ cls: 'tm2-bar' });
-    const search = bar.createDiv({ cls: 'tm2-search' });
-    setIcon(search.createSpan({ cls: 'tm2-search-icon' }), 'search');
-    this.searchInput = search.createEl('input', { attr: { type: 'text', placeholder: 'Search' } });
-    this.searchInput.addEventListener('input', () => {
-      this.query = this.searchInput.value.toLowerCase();
-      this.renderList();
-    });
-    this.searchInput.addEventListener('keydown', e => {
-      if (e.key === 'Escape') { this.searchInput.value = ''; this.query = ''; this.renderList(); }
-    });
-
-    this.sortBtn = bar.createDiv({ cls: 'tm2-sort' });
+    const searchBtn = tools.createDiv({ cls: 'tm3-ibtn', attr: { 'aria-label': 'Search' } });
+    setIcon(searchBtn, 'search');
+    this.sortBtn = tools.createDiv({ cls: 'tm3-ibtn', attr: { 'aria-label': 'Sort' } });
     this.paintSort();
     this.sortBtn.onclick = ev => {
       const m = new Menu();
@@ -203,14 +273,47 @@ class TaskView extends ItemView {
           .onClick(() => { this.sort = k; this.paintSort(); this.renderList(); })));
       m.showAtMouseEvent(ev);
     };
+    this.monthBtn = tools.createDiv({ cls: 'tm3-pill' });
+    this.monthBtn.onclick = ev => this.monthMenu(ev);
 
-    this.tabsEl = this.root.createDiv({ cls: 'tm2-tabs' });
+    /* search: hidden until asked for */
+    const search = H.createDiv({ cls: 'tm2-search tm3-search' });
+    search.hide();
+    setIcon(search.createSpan({ cls: 'tm2-search-icon' }), 'search');
+    this.searchInput = search.createEl('input', { attr: { type: 'text', placeholder: 'Search tasks' } });
+    this.searchInput.addEventListener('input', () => {
+      this.query = this.searchInput.value.toLowerCase();
+      this.renderList();
+    });
+    const closeSearch = () => { this.searchInput.value = ''; this.query = ''; search.hide(); this.renderList(); };
+    this.searchInput.addEventListener('keydown', e => { if (e.key === 'Escape') closeSearch(); });
+    searchBtn.onclick = () => {
+      if (search.isShown()) closeSearch();
+      else { search.show(); this.searchInput.focus(); }
+    };
 
-    const sec = this.root.createDiv({ cls: 'tm2-sec' });
-    this.secTitle = sec.createDiv({ cls: 'tm2-sec-t' });
-    this.secCount = sec.createDiv({ cls: 'tm2-sec-n' });
+    /* week strip */
+    this.daysEl = H.createDiv({ cls: 'tm3-wk' });
 
-    this.listEl = this.root.createDiv({ cls: 'tm2-list' });
+    /* projects */
+    const pl = H.createDiv({ cls: 'tm3-lab' });
+    const pll = pl.createDiv({ cls: 'tm3-lab-l' });
+    setIcon(pll.createSpan({ cls: 'tm3-i' }), 'folder');
+    pll.createSpan({ text: 'Projects' });
+    this.seeAllEl = pl.createDiv({ cls: 'tm3-lab-r' });
+    this.seeAllEl.onclick = () => { this.allProjects = !this.allProjects; this.renderProjects(); };
+    this.projEl = H.createDiv({ cls: 'tm3-grid' });
+
+    /* tasks: heading, count, filter */
+    const tl = H.createDiv({ cls: 'tm3-lab tm3-lab-tasks' });
+    const tll = tl.createDiv({ cls: 'tm3-lab-l' });
+    this.secTitle = tll.createSpan({ text: 'Tasks' });
+    this.secCount = tll.createSpan({ cls: 'tm3-n' });
+    this.tabsEl = tl.createDiv({ cls: 'tm3-pill' });
+    this.tabsEl.onclick = ev => this.filterMenu(ev);
+
+    this.listEl = H.createDiv({ cls: 'tm2-list' });
+
     this.undoEl = this.root.createDiv({ cls: 'tm2-undo' });
     this.undoEl.style.display = 'none';
 
@@ -229,17 +332,54 @@ class TaskView extends ItemView {
     });
 
     const hint = this.root.createDiv({ cls: 'tm2-hint' });
-    [['!high', ' · '], ['@tomorrow', ' · '], ['#tag', ' · '], ['/project', '']]
+    [['!high', ' · '], ['@tomorrow', ' · '], ['9:30', ' · '], ['#tag', ' · '], ['/project', '']]
       .forEach(([code, after]) => {
         hint.createEl('code', { text: code });
         if (after) hint.createSpan({ text: after });
       });
   }
 
+  monthMenu(ev) {
+    const m = new Menu();
+    const now = new Date(todayISO() + 'T00:00');
+    m.addItem(i => i.setTitle('Today').setIcon('calendar-check').onClick(() => this.gotoDay(todayISO())));
+    m.addSeparator();
+    for (let k = -2; k <= 6; k++) {
+      const d = new Date(now.getFullYear(), now.getMonth() + k, 1);
+      const iso = k === 0 ? todayISO() : d.toLocaleDateString('en-CA');
+      m.addItem(i => i
+        .setTitle(d.toLocaleDateString(undefined, { month: 'long', year: 'numeric' }))
+        .onClick(() => this.gotoDay(iso)));
+    }
+    m.showAtMouseEvent(ev);
+  }
+
+  gotoDay(iso) {
+    this.tab = 'day';
+    this.day = iso;
+    this.weekStart = mondayOf(iso);
+    this.renderTop(); this.renderDays(); this.renderTabs(); this.renderList();
+  }
+
+  filterMenu(ev) {
+    const c = this.counts();
+    const m = new Menu();
+    const pick = fn => () => { fn(); this.renderDays(); this.renderTabs(); this.renderList(); };
+    m.addItem(i => i.setTitle('Today' + (c.today ? `  ·  ${c.today}` : '')).setIcon('sun')
+      .setChecked(this.tab === 'day' && this.day === todayISO())
+      .onClick(() => this.gotoDay(todayISO())));
+    m.addSeparator();
+    TABS.forEach(t => m.addItem(i => i
+      .setTitle(t.label + (c[t.id] ? `  ·  ${c[t.id]}` : ''))
+      .setChecked(this.tab === t.id)
+      .onClick(pick(() => { this.tab = t.id; }))));
+    m.showAtMouseEvent(ev);
+  }
+
   paintSort() {
     this.sortBtn.empty();
-    setIcon(this.sortBtn.createSpan(), 'arrow-up-down');
-    this.sortBtn.createSpan({ text: { due: 'Due', priority: 'Priority', project: 'Project', text: 'Name' }[this.sort] });
+    setIcon(this.sortBtn, 'arrow-up-down');
+    this.sortBtn.setAttr('aria-label', 'Sort: ' + { due: 'Due date', priority: 'Priority', project: 'Project', text: 'Name' }[this.sort]);
   }
 
   /* ── data ──────────────────────────────────────────────────────── */
@@ -260,11 +400,33 @@ class TaskView extends ItemView {
       const start = lines.findIndex(l => RE_H_TASKS.test(l.trim()));
       if (start === -1) return;
 
+      const seen = new Set();
       for (let i = start + 1; i < lines.length; i++) {
         const line = lines[i];
         if (/^#{1,6}\s/.test(line)) break;           // next heading ends the section
         const t = parseTaskLine(line);
         if (!t) continue;
+
+        /* a copied line carries someone else's ^id: treat it as new, so a
+           tick or edit hits this line (and it gets its own id then) */
+        if (t.id && seen.has(t.id)) t.id = null;
+        if (t.id) seen.add(t.id);
+
+        /* typed straight into the note (no id yet): read the same shortcuts
+           as the Add box — @today, !high, #tag, 9:30, 9:00-15:00, every day.
+           Nothing is rewritten while you type; the first tick or edit saves
+           the line in the normal format. */
+        if (!t.id && /(^|\s)(@\S|!(high|medium|low)\b|#\S|\d{1,2}:\d{2}|\d{1,2}\s?(am|pm)\b|every |daily|weekly|monthly|weekdays)/i.test(t.text)) {
+          const q = this.parseQuick(t.text);
+          if (q.text) {
+            t.text = q.text;
+            if (q.due && !t.due) t.due = q.due;
+            if (q.priority && !t.priority) t.priority = q.priority;
+            if (q.time && !t.time) { t.time = q.time; t.end = q.end; }
+            if (q.repeat && !t.repeat) t.repeat = q.repeat;
+            q.tags.forEach(x => { if (!t.tags.includes(x)) t.tags.push(x); });
+          }
+        }
         t.file = file;
         t.project = file.basename;
         t.lineNo = i;
@@ -275,8 +437,10 @@ class TaskView extends ItemView {
     this.tasks = out;
     this.renderTop();
     this.renderDays();
+    this.renderProjects();
     this.renderTabs();
     this.renderList();
+    this.renderPage();
   }
 
   filtered() {
@@ -332,39 +496,35 @@ class TaskView extends ItemView {
   /* ── render: hero ──────────────────────────────────────────────── */
 
   renderTop() {
-    const c = this.counts();
-    const total = this.tasks.length;
-    this.renderRing(total ? c.done / total : 0);
-
-    const line = !total
-      ? 'Nothing tracked yet'
-      : c.overdue
-        ? `${c.overdue} overdue · ${c.all} open`
-        : c.today
-          ? `${c.today} due today · ${c.all} open`
-          : c.all
-            ? `Nothing due today · ${c.all} open`
-            : 'All clear';
-    this.subEl.setText(line);
+    /* month shown = the month most of the visible week is in */
+    const mid = new Date(shiftISO(this.weekStart, 3) + 'T00:00');
+    this.monthBtn.empty();
+    this.monthBtn.createSpan({ text: mid.toLocaleDateString(undefined, { month: 'long', year: 'numeric' }) });
+    setIcon(this.monthBtn.createSpan({ cls: 'tm3-i' }), 'chevron-down');
   }
 
   renderDays() {
     const today = todayISO();
     this.daysEl.empty();
 
-    for (let i = 0; i < STRIP_LEN; i++) {
-      const iso = shiftISO(today, i - STRIP_BACK);
+    const nav = (icon, step, label) => {
+      const b = this.daysEl.createDiv({ cls: 'tm3-wk-nav', attr: { 'aria-label': label } });
+      setIcon(b, icon);
+      b.onclick = () => { this.weekStart = shiftISO(this.weekStart, step); this.renderTop(); this.renderDays(); };
+    };
+    nav('chevron-left', -7, 'Previous week');
+
+    for (let i = 0; i < 7; i++) {
+      const iso = shiftISO(this.weekStart, i);
       const d = new Date(iso + 'T00:00');
-      const n = this.dayCount(iso);
-
-      const cls = 'tm2-dayc'
+      const cls = 'tm3-day'
         + (iso === today ? ' is-today' : '')
-        + (this.tab === 'day' && iso === this.day ? ' is-on' : '');
+        + (this.tab === 'day' && iso === this.day ? ' is-on' : '')
+        + (this.dayCount(iso) ? ' has-tasks' : '');
       const cell = this.daysEl.createDiv({ cls });
-      cell.createDiv({ cls: 'tm2-dayc-n', text: String(d.getDate()) });
-      cell.createDiv({ cls: 'tm2-dayc-w', text: d.toLocaleDateString(undefined, { weekday: 'short' }) });
-      if (n) cell.createDiv({ cls: 'tm2-dayc-dot' });
-
+      cell.createDiv({ cls: 'tm3-day-w', text: d.toLocaleDateString(undefined, { weekday: 'short' }) });
+      cell.createDiv({ cls: 'tm3-day-n', text: String(d.getDate()) });
+      cell.createDiv({ cls: 'tm3-day-dot' });
       cell.onclick = () => {
         this.tab = 'day';
         this.day = iso;
@@ -373,48 +533,183 @@ class TaskView extends ItemView {
         this.renderList();
       };
     }
+    nav('chevron-right', 7, 'Next week');
   }
 
-  renderRing(pct) {
-    const size = 58, sw = 6, r = (size - sw) / 2, circ = 2 * Math.PI * r;
-    this.ringEl.empty();
+  /* ── render: projects grid ─────────────────────────────────────── */
 
-    const svg = document.createElementNS(SVG_NS, 'svg');
-    svg.setAttribute('viewBox', `0 0 ${size} ${size}`);
+  projectStats() {
+    const by = new Map();
+    this.projectFiles().forEach(f => by.set(f.path, { file: f, total: 0, done: 0, open: 0 }));
+    this.tasks.forEach(t => {
+      const p = by.get(t.file.path);
+      if (!p) return;
+      p.total++; t.done ? p.done++ : p.open++;
+    });
+    /* busiest first; empty projects last */
+    return [...by.values()].sort((a, b) => b.open - a.open || b.total - a.total || a.file.basename.localeCompare(b.file.basename));
+  }
 
-    const circle = (cls, dash) => {
-      const c = document.createElementNS(SVG_NS, 'circle');
-      c.setAttribute('cx', size / 2); c.setAttribute('cy', size / 2); c.setAttribute('r', r);
-      c.setAttribute('fill', 'none');
-      c.setAttribute('stroke-width', sw);
-      c.setAttribute('stroke-linecap', 'round');
-      c.setAttribute('class', cls);
-      if (dash != null) c.setAttribute('stroke-dasharray', `${dash} ${circ}`);
-      return c;
+  progressEl(host, p) {
+    const el = host.createDiv({ cls: 'tm3-prog' });
+    const tone = !p.total ? 'none' : p.open === 0 ? 'ok' : 'a';
+    setIcon(el.createSpan({ cls: 'tm3-i tm3-tone-' + tone }), p.total && p.open === 0 ? 'circle-check' : 'loader');
+    if (!p.total) { el.createSpan({ text: 'No tasks yet' }); return el; }
+    const s = el.createSpan();
+    s.createEl('b', { cls: 'tm3-tone-' + tone, text: `${p.done}/${p.total}` });
+    s.appendText(' completed');
+    return el;
+  }
+
+  renderProjects() {
+    const all = this.projectStats();
+    const LIMIT = 4;
+    this.projEl.empty();
+    this.seeAllEl.empty();
+    if (all.length > LIMIT) {
+      this.seeAllEl.createSpan({ text: this.allProjects ? 'Show less' : `See all (${all.length})` });
+      setIcon(this.seeAllEl.createSpan({ cls: 'tm3-i' }), this.allProjects ? 'chevron-up' : 'chevron-right');
+    }
+    if (!all.length) {
+      this.projEl.createDiv({ cls: 'tm3-grid-empty', text: 'No projects yet. Add type: Project to a note’s properties.' });
+      return;
+    }
+    (this.allProjects ? all : all.slice(0, LIMIT)).forEach(p => {
+      const card = this.projEl.createDiv({ cls: 'tm3-pc' });
+      const top = card.createDiv({ cls: 'tm3-pc-top' });
+      setIcon(top.createDiv({ cls: 'tm3-pc-ic' }), 'folder');
+      const more = top.createDiv({ cls: 'tm3-pc-more', attr: { 'aria-label': 'More' } });
+      setIcon(more, 'more-horizontal');
+      more.onclick = ev => {
+        ev.stopPropagation();
+        const m = new Menu();
+        m.addItem(i => i.setTitle('Open note').setIcon('file-text')
+          .onClick(() => this.app.workspace.openLinkText(p.file.path, '', false)));
+        m.addItem(i => i.setTitle('New tasks go here by default').setIcon('inbox')
+          .setChecked(this.plugin.settings.defaultProject === p.file.basename)
+          .onClick(async () => { this.plugin.settings.defaultProject = p.file.basename; await this.plugin.saveSettings(); }));
+        m.showAtMouseEvent(ev);
+      };
+      card.createDiv({ cls: 'tm3-pc-n', text: p.file.basename });
+      this.progressEl(card, p);
+      card.onclick = () => this.openProject(p.file.path);
+    });
+  }
+
+  /* ── one project's page ────────────────────────────────────────── */
+
+  openProject(path) {
+    this.project = path;
+    this.allDone = false;
+    this.homeEl.hide();
+    this.pageEl.show();
+    this.renderPage();
+    this.contentEl.scrollTop = 0;
+  }
+
+  closeProject() {
+    this.project = null;
+    this.pageEl.hide();
+    this.homeEl.show();
+    this.addInput.setAttr('placeholder', 'Add a task…');
+  }
+
+  renderPage() {
+    if (!this.project) return;
+    const file = this.app.vault.getAbstractFileByPath(this.project);
+    if (!file) { this.closeProject(); return; }
+    const E = this.pageEl;
+    E.empty();
+    this.addInput.setAttr('placeholder', `Add a task to ${file.basename}…`);
+
+    const mine = this.tasks.filter(t => t.file.path === file.path);
+    const done = mine.filter(t => t.done)
+      .sort((a, b) => (a.doneOn || '').localeCompare(b.doneOn || '') || b.lineNo - a.lineNo);
+    const open = mine.filter(t => !t.done)
+      .sort((a, b) => (a.due || '9999').localeCompare(b.due || '9999')
+        || (a.time || '99').localeCompare(b.time || '99') || a.lineNo - b.lineNo);
+
+    /* header */
+    const hd = E.createDiv({ cls: 'tm3-hd' });
+    const title = hd.createDiv({ cls: 'tm3-hd-t' });
+    const back = title.createDiv({ cls: 'tm3-ibtn tm3-back', attr: { 'aria-label': 'Back' } });
+    setIcon(back, 'arrow-left');
+    back.onclick = () => this.closeProject();
+    setIcon(title.createSpan({ cls: 'tm3-i' }), 'folder');
+    title.createSpan({ cls: 'tm3-hd-name', text: file.basename });
+    const edit = hd.createDiv({ cls: 'tm3-ibtn', attr: { 'aria-label': 'Open note' } });
+    setIcon(edit, 'square-pen');
+    edit.onclick = () => this.app.workspace.openLinkText(file.path, '', false);
+
+    /* summary */
+    const sum = E.createDiv({ cls: 'tm3-sum' });
+    const cell = (label, value, cls = '') => {
+      const c = sum.createDiv({ cls: 'tm3-sum-c' });
+      c.createDiv({ cls: 'tm3-sum-l', text: label });
+      c.createDiv({ cls: 'tm3-sum-v ' + cls, text: value });
     };
-    svg.appendChild(circle('tm2-ring-bg'));
-    svg.appendChild(circle('tm2-ring-fg', (circ * pct).toFixed(2)));
+    const nextDue = open.find(t => t.due);
+    const today = todayISO();
+    cell('Next due', nextDue ? this.prettyDate(nextDue.due) : '—',
+      nextDue ? (nextDue.due < today ? 'is-overdue' : nextDue.due === today ? 'is-today' : '') : '');
+    sum.createDiv({ cls: 'tm3-sum-sep' });
+    const lastDone = done.filter(t => t.doneOn).pop();
+    cell('Last done', lastDone ? this.prettyDate(lastDone.doneOn) : '—');
 
-    this.ringEl.appendChild(svg);
-    this.ringEl.createDiv({ cls: 'tm2-ring-n', text: Math.round(pct * 100) + '%' });
+    const stat = { total: mine.length, done: done.length, open: open.length };
+    this.progressEl(E, stat).addClass('tm3-prog-lg');
+    const bar = E.createDiv({ cls: 'tm3-bar' });
+    bar.createDiv({ cls: 'tm3-bar-f' }).style.width = (stat.total ? Math.round(stat.done / stat.total * 100) : 0) + '%';
+
+    if (!mine.length) {
+      const e = E.createDiv({ cls: 'tm2-empty' });
+      setIcon(e.createDiv({ cls: 'tm2-empty-icon' }), 'check-circle');
+      e.createDiv({ text: 'No tasks in this project yet' });
+      e.createDiv({ cls: 'tm2-empty-sub', text: 'Add one below' });
+      return;
+    }
+
+    /* numbered list: done first, then what is next */
+    const th = E.createDiv({ cls: 'tm3-th' });
+    th.createSpan({ text: 'Task' }); th.createSpan({ text: 'Description' }); th.createSpan({ text: 'Status' });
+
+    const KEEP = 3;
+    const hidden = this.allDone ? 0 : Math.max(0, done.length - KEEP);
+    if (done.length > KEEP) {
+      const more = E.createDiv({ cls: 'tm3-earlier' });
+      more.setText(this.allDone ? 'Hide earlier completed' : `Show ${hidden} earlier completed`);
+      more.onclick = () => { this.allDone = !this.allDone; this.renderPage(); };
+    }
+
+    [...done, ...open].forEach((t, i) => {
+      if (i < hidden) return;
+      const row = E.createDiv({ cls: 'tm3-tr' + (t.done ? ' is-done' : '') });
+      const isNext = !t.done && t === open[0];
+      row.createDiv({ cls: 'tm3-num' + (isNext ? ' is-next' : ''), text: String(i + 1) });
+
+      const body = row.createDiv({ cls: 'tm3-tr-b' });
+      const name = body.createDiv({ cls: 'tm3-tr-t', text: t.text });
+      name.onclick = () => this.openEditor(t);
+      this.metaLine(t, body, { hideProject: true });
+
+      const st = row.createDiv({ cls: 'tm3-st' });
+      const box = st.createDiv({ cls: 'tm2-check' + (t.done ? ' is-on' : '') + (t.priority ? ` tm3-p-${t.priority.toLowerCase()}` : '') });
+      box.onclick = e => { e.stopPropagation(); this.toggle(t); };
+      if (t.done && t.doneOn) st.createDiv({ cls: 'tm3-st-d', text: this.prettyDate(t.doneOn) });
+
+      row.oncontextmenu = ev => { ev.preventDefault(); this.rowMenu(ev, t); };
+    });
   }
 
-  /* ── render: tabs + list ───────────────────────────────────────── */
+  /* ── render: filter + list ─────────────────────────────────────── */
 
   renderTabs() {
-    const c = this.counts();
+    const label = this.tab === 'day'
+      ? this.sectionTitle()
+      : (TABS.find(t => t.id === this.tab) || {}).label || 'All';
     this.tabsEl.empty();
-    TABS.forEach(t => {
-      const el = this.tabsEl.createDiv({ cls: 'tm2-tab' + (this.tab === t.id ? ' is-active' : '') });
-      el.createSpan({ text: t.label });
-      if (c[t.id]) el.createSpan({ cls: 'tm2-tab-n', text: String(c[t.id]) });
-      el.onclick = () => {
-        this.tab = t.id;
-        this.renderDays();          // clears the date-strip selection
-        this.renderTabs();
-        this.renderList();
-      };
-    });
+    this.tabsEl.createSpan({ text: label });
+    setIcon(this.tabsEl.createSpan({ cls: 'tm3-i' }), 'chevron-down');
   }
 
   /** what the list below is currently showing */
@@ -434,8 +729,8 @@ class TaskView extends ItemView {
     this.listEl.empty();
     const list = this.filtered();
 
-    this.secTitle.setText(this.sectionTitle());
-    this.secCount.setText(list.length ? `${list.length} task${list.length > 1 ? 's' : ''}` : '');
+    this.secCount.setText(String(list.length));
+    this.secCount.toggle(!!list.length);
 
     if (!list.length) {
       const e = this.listEl.createDiv({ cls: 'tm2-empty' });
@@ -458,6 +753,24 @@ class TaskView extends ItemView {
       return;
     }
 
+    /* a single day: Anytime, Morning, Midday, Afternoon, Evening */
+    if (this.tab === 'day' && this.sort !== 'project') {
+      const order = new Map(list.map((t, i) => [t, i]));
+      const buckets = DAY_GROUPS.map(g => ({ g, items: [] }));
+      list.forEach(t => buckets[DAY_GROUPS.indexOf(groupOf(t))].items.push(t));
+      buckets.forEach(({ g, items }) => {
+        if (!items.length) return;
+        /* by time within a group; untimed keep the chosen sort */
+        items.sort((a, b) => (a.time && b.time ? toMin(a.time) - toMin(b.time) : 0) || order.get(a) - order.get(b));
+        const hd = this.listEl.createDiv({ cls: 'tm2-group tm2-tgroup' });
+        setIcon(hd.createSpan({ cls: 'tm2-tgroup-i' }), g.icon);
+        hd.createSpan({ cls: 'tm2-tgroup-t', text: g.label });
+        hd.createSpan({ cls: 'tm2-tgroup-n', text: String(items.length) });
+        items.forEach(t => this.listEl.appendChild(this.taskRow(t)));
+      });
+      return;
+    }
+
     let lastProject = null;
     list.forEach(t => {
       if (this.sort === 'project' && t.project !== lastProject) {
@@ -468,42 +781,62 @@ class TaskView extends ItemView {
     });
   }
 
+  /** the details line: small Lucide icons and plain text */
+  metaLine(t, host, opts = {}) {
+    const today = todayISO();
+    const overdue = !t.done && t.due && t.due < today;
+    const meta = host.createDiv({ cls: 'tm2-meta' });
+    const item = (icon, label, cls = '', title = '') => {
+      const el = meta.createSpan({ cls: 'tm2-mi' + (cls ? ' ' + cls : '') });
+      setIcon(el.createSpan({ cls: 'tm2-i' }), icon);
+      el.createSpan({ text: label });
+      if (title) el.setAttr('title', title);
+      return el;
+    };
+    if (t.time) {
+      item('clock', t.end ? `${t.time}–${t.end} · ${slotLength(t.time, t.end)}` : t.time, 'tm2-mi-time');
+    }
+    if (t.due && !opts.hideDue) {
+      let c = 'tm2-mi-due';
+      if (overdue) c += ' is-overdue';
+      else if (t.due === today) c += ' is-today';
+      item(overdue ? 'alarm-clock' : 'calendar', this.prettyDate(t.due), c);
+    }
+    if (t.project && !opts.hideProject) item('folder', t.project, 'tm2-mi-project');
+    if (t.priority) item('flag', t.priority, `tm2-mi-prio tm2-mi-${t.priority.toLowerCase()}`);
+    if (t.repeat) item('repeat', REPEAT_LABEL[t.repeat] || t.repeat, 'tm2-mi-repeat');
+    if (t.moves) item('history', String(t.moves), 'tm2-mi-moved',
+      `Rescheduled ${t.moves}×` + (t.from ? ` · originally ${this.prettyDate(t.from)}` : ''));
+    t.tags.forEach(tag => item('hash', tag, 'tm2-mi-tag'));
+    if (!meta.childElementCount) meta.remove();
+    return meta;
+  }
+
   taskRow(t) {
     const today = todayISO();
     const overdue = !t.done && t.due && t.due < today;
 
-    let cls = 'tm2-row';
+    let cls = 'tm2-row tm3-card';
     if (t.done) cls += ' is-done';
     if (t.priority) cls += ` tm2-p-${t.priority.toLowerCase()}`;
     if (overdue && !t.done) cls += ' is-overdue';
     const row = createDiv({ cls });
 
-    const box = row.createDiv({ cls: 'tm2-check' + (t.done ? ' is-on' : '') });
-    box.onclick = e => { e.stopPropagation(); this.toggle(t); };
-
+    /* project on top, title, details; checkbox on the right */
     const body = row.createDiv({ cls: 'tm2-body' });
+    const proj = body.createDiv({ cls: 'tm3-card-p', text: t.project });
+    proj.onclick = e => { e.stopPropagation(); this.openProject(t.file.path); };
     const text = body.createDiv({ cls: 'tm2-text', text: t.text });
-    text.onclick = () => this.inlineEdit(t, text);
+    text.onclick = () => (Platform.isMobile ? this.openEditor(t) : this.inlineEdit(t, text));
+    this.metaLine(t, body, { hideProject: true, hideDue: this.tab === 'day' && t.due === this.day });
 
-    const meta = body.createDiv({ cls: 'tm2-meta' });
-    meta.createSpan({ cls: 'tm2-chip tm2-project', text: t.project });
-    if (t.priority) meta.createSpan({ cls: `tm2-chip tm2-prio-${t.priority.toLowerCase()}`, text: t.priority });
-    if (t.due) {
-      let dueCls = 'tm2-chip tm2-due';
-      if (overdue) dueCls += ' is-overdue';
-      else if (t.due === today) dueCls += ' is-today';
-      meta.createSpan({ cls: dueCls, text: this.prettyDate(t.due) });
-    }
-    if (t.moves) {
-      const chip = meta.createSpan({ cls: 'tm2-chip tm2-moved', text: `↻ ${t.moves}` });
-      chip.setAttr('title', `Rescheduled ${t.moves}×` + (t.from ? ` · originally ${this.prettyDate(t.from)}` : ''));
-    }
-    t.tags.forEach(tag => meta.createSpan({ cls: 'tm2-chip tm2-tag', text: tag }));
-
-    const acts = row.createDiv({ cls: 'tm2-acts' });
-    const more = acts.createDiv({ cls: 'tm2-act' });
+    const side = row.createDiv({ cls: 'tm3-card-r' });
+    const box = side.createDiv({ cls: 'tm2-check' + (t.done ? ' is-on' : '') });
+    box.onclick = e => { e.stopPropagation(); this.toggle(t); };
+    const more = side.createDiv({ cls: 'tm2-act tm3-card-more', attr: { 'aria-label': 'More' } });
     setIcon(more, 'more-horizontal');
     more.onclick = ev => { ev.stopPropagation(); this.rowMenu(ev, t); };
+    row.oncontextmenu = ev => { ev.preventDefault(); this.rowMenu(ev, t); };
 
     return row;
   }
@@ -595,8 +928,38 @@ class TaskView extends ItemView {
     }
   }
 
-  toggle(t) {
-    return this.patch(t, { done: !t.done });
+  async toggle(t) {
+    if (t.done || !t.repeat) return this.patch(t, { done: !t.done });
+
+    /* repeating: tick this one off and add the next one right below it */
+    const nextDue = nextOccurrence(t.due || todayISO(), t.repeat);
+    const doneT = Object.assign({}, t, { done: true, doneOn: todayISO() });
+    if (!doneT.id) doneT.id = newId();
+    const fresh = {
+      indent: t.indent || '', done: false, id: newId(),
+      text: t.text, due: nextDue, time: t.time, end: t.end, repeat: t.repeat,
+      priority: t.priority, tags: [...t.tags], moves: 0, from: '',
+    };
+    try {
+      await mutate(this.app, t.file, lines => {
+        const i = this.findLine(lines, t);
+        if (i === -1) throw new Error('not found');
+        lines[i] = serialiseTask(doneT);
+        /* never twice: if an open copy for that date already exists
+           (ticked, unticked, ticked again), don't add another one */
+        const twin = lines.some(l => {
+          const x = parseTaskLine(l);
+          return x && !x.done && x.text === fresh.text && x.repeat === fresh.repeat && x.due === fresh.due;
+        });
+        if (!twin) lines.splice(i + 1, 0, serialiseTask(fresh));
+        return lines;
+      });
+      new Notice(`Done \u00b7 next on ${this.prettyDate(nextDue)}`);
+      await this._refresh();
+    } catch (e) {
+      console.error('[task-manager] repeat failed', e, t);
+      new Notice('Could not find that task line — nothing changed');
+    }
   }
 
   async remove(t) {
@@ -656,6 +1019,20 @@ class TaskView extends ItemView {
     }
     const project = take(/\s\/([^\s]+)/);
 
+    /* time: needs a colon or am/pm, so "read 10-20 pages" stays text */
+    const ampm = (h, ap) => { h = +h % 12; if (/p/i.test(ap)) h += 12; return `${h}:00`; };
+    let time = '', end = '';
+    const slot = s.match(/\s(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})(?=\s)/);
+    if (slot) { time = normTime(slot[1]); end = normTime(slot[2]); s = s.replace(slot[0], ' '); }
+    else {
+      const one = s.match(/\s(\d{1,2}:\d{2})(?=\s)/) || s.match(/\s(\d{1,2})\s?(am|pm)(?=\s)/i);
+      if (one) { time = normTime(one[2] ? ampm(one[1], one[2]) : one[1]); s = s.replace(one[0], ' '); }
+    }
+    const repWord = take(/\s(every day|daily|every weekday|weekdays|every week|weekly|every month|monthly)(?=\s)/i).toLowerCase();
+    const repeat = { 'every day': 'day', daily: 'day', 'every weekday': 'weekday', weekdays: 'weekday',
+      'every week': 'week', weekly: 'week', 'every month': 'month', monthly: 'month' }[repWord] || '';
+    if (repeat && !due) due = todayISO();
+
     const tags = [];
     let m;
     const tagRe = /\s#([^\s#]+)/;
@@ -664,7 +1041,7 @@ class TaskView extends ItemView {
     return {
       text: s.replace(/\s{2,}/g, ' ').trim(),
       priority: prio ? prio[0].toUpperCase() + prio.slice(1).toLowerCase() : '',
-      due, project, tags,
+      due, project, tags, time, end, repeat,
     };
   }
 
@@ -684,11 +1061,13 @@ class TaskView extends ItemView {
       ? files.find(f => f.basename.toLowerCase().startsWith(q.project.toLowerCase()))
       : null;
     if (q.project && !file) { new Notice(`No project matching “${q.project}”`); return; }
+    if (!file && this.project) file = files.find(f => f.path === this.project);
     if (!file) file = files.find(f => f.basename === this.plugin.settings.defaultProject) || files[0];
 
     const task = {
       indent: '', done: false, id: newId(),
       text: q.text, due: q.due, priority: q.priority, tags: q.tags,
+      time: q.time, end: q.end, repeat: q.repeat,
     };
 
     await mutate(this.app, file, lines => {
@@ -747,6 +1126,45 @@ class TaskView extends ItemView {
     });
 
     const dueIn = field('Due date').createEl('input', { attr: { type: 'date', value: t.due || '' } });
+
+    /* time: Anytime / At a time / Time slot */
+    let tmode = t.time ? (t.end ? 'slot' : 'at') : 'any';
+    const tf = field('Time');
+    const tseg = tf.createDiv({ cls: 'tm2-seg' });
+    const trow = tf.createDiv({ cls: 'tm2-time-row' });
+    const startIn = trow.createEl('input', { attr: { type: 'time', value: t.time || '09:00' } });
+    const dash = trow.createSpan({ cls: 'tm2-time-dash', text: '\u2013' });
+    const endIn = trow.createEl('input', { attr: { type: 'time', value: t.end || '' } });
+    const lenEl = trow.createSpan({ cls: 'tm2-time-len' });
+    const paintLen = () => {
+      const a = normTime(startIn.value), b = normTime(endIn.value);
+      lenEl.setText(tmode === 'slot' && a && b ? slotLength(a, b) : '');
+    };
+    const tBtns = [];
+    const paintTime = () => {
+      tBtns.forEach(b => b.toggleClass('is-on', b.dataset.m === tmode));
+      trow.toggle(tmode !== 'any');
+      dash.toggle(tmode === 'slot'); endIn.toggle(tmode === 'slot');
+      if (tmode === 'slot' && !endIn.value && startIn.value) {
+        const m = (toMin(normTime(startIn.value) || '09:00') + 60) % 1440;
+        endIn.value = `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+      }
+      paintLen();
+    };
+    [['any', 'Anytime'], ['at', 'At a time'], ['slot', 'Time slot']].forEach(([m, label]) => {
+      const b = tseg.createDiv({ cls: 'tm2-seg-b', text: label });
+      b.dataset.m = m;
+      b.onclick = () => { tmode = m; paintTime(); };
+      tBtns.push(b);
+    });
+    startIn.oninput = paintLen; endIn.oninput = paintLen;
+    paintTime();
+
+    const repSel = field('Repeat').createEl('select');
+    REPEATS.forEach(([v, label]) => {
+      const o = repSel.createEl('option', { text: label, value: v });
+      if ((t.repeat || '') === v) o.selected = true;
+    });
     const tagIn = field('Tags').createEl('input', { attr: { type: 'text', value: t.tags.join(', '), placeholder: 'comma separated' } });
 
     const foot = sheet.createDiv({ cls: 'tm2-sheet-foot' });
@@ -760,7 +1178,13 @@ class TaskView extends ItemView {
         priority,
         due: dueIn.value,
         tags: tagIn.value.split(',').map(s => s.trim()).filter(Boolean),
+        time: tmode === 'any' ? '' : normTime(startIn.value),
+        end:  tmode === 'slot' ? normTime(endIn.value) : '',
+        repeat: repSel.value,
       };
+      if (!changes.time) changes.end = '';
+      /* a repeating task needs a date to repeat from */
+      if (changes.repeat && !changes.due) changes.due = todayISO();
       const target = this.app.vault.getAbstractFileByPath(projSel.value);
       close();
       if (target && target.path !== t.file.path) await this.move(t, target, changes);
