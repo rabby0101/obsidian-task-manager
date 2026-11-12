@@ -550,14 +550,15 @@ class TaskView extends ItemView {
     return [...by.values()].sort((a, b) => b.open - a.open || b.total - a.total || a.file.basename.localeCompare(b.file.basename));
   }
 
+  /** progress: a thin bar with a small "4/17" at its end */
   progressEl(host, p) {
     const el = host.createDiv({ cls: 'tm3-prog' });
-    const tone = !p.total ? 'none' : p.open === 0 ? 'ok' : 'a';
-    setIcon(el.createSpan({ cls: 'tm3-i tm3-tone-' + tone }), p.total && p.open === 0 ? 'circle-check' : 'loader');
-    if (!p.total) { el.createSpan({ text: 'No tasks yet' }); return el; }
-    const s = el.createSpan();
-    s.createEl('b', { cls: 'tm3-tone-' + tone, text: `${p.done}/${p.total}` });
-    s.appendText(' completed');
+    const pct = p.total ? Math.round(p.done / p.total * 100) : 0;
+    const bar = el.createDiv({ cls: 'tm3-prog-bar' });
+    const fill = bar.createDiv({ cls: 'tm3-prog-fill' + (p.total && p.open === 0 ? ' is-done' : '') });
+    fill.style.width = pct + '%';
+    el.createSpan({ cls: 'tm3-prog-n', text: p.total ? `${p.done}/${p.total}` : '0' });
+    el.setAttr('aria-label', p.total ? `${p.done} of ${p.total} completed` : 'No tasks yet');
     return el;
   }
 
@@ -658,8 +659,6 @@ class TaskView extends ItemView {
 
     const stat = { total: mine.length, done: done.length, open: open.length };
     this.progressEl(E, stat).addClass('tm3-prog-lg');
-    const bar = E.createDiv({ cls: 'tm3-bar' });
-    bar.createDiv({ cls: 'tm3-bar-f' }).style.width = (stat.total ? Math.round(stat.done / stat.total * 100) : 0) + '%';
 
     if (!mine.length) {
       const e = E.createDiv({ cls: 'tm2-empty' });

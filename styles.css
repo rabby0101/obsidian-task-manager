@@ -796,3 +796,63 @@ body:not(.is-mobile) .mod-right-split .tm2 {
   --t2-c3:   color-mix(in srgb, var(--text-normal) 18%, var(--background-secondary));
   --t2-line: color-mix(in srgb, var(--text-normal) 10%, var(--background-secondary));
 }
+
+/* Mobile: one side gutter instead of two. Obsidian pads the pane and the
+   view padded itself again (about 26px a side); now it is 12px in total. */
+.is-mobile .workspace-leaf-content[data-type="rabby-task-manager-view"] > .view-content {
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+}
+.is-mobile .tm2 { padding-left: 12px; padding-right: 12px; }
+.is-mobile .tm2-dock { margin-left: 0; margin-right: 0; }
+
+/* ── inputs: one shape each ──────────────────────────────────────────
+   Obsidian's mobile theme gives every text input its own pill (fill,
+   border, focus ring). Inside the search bar and the Add box that drew
+   a second pill inside ours. The wrapper is the only visible shape. */
+.tm2 .tm2-search input,
+.tm2 .tm2-search input:focus,
+.tm2 .tm2-search input:hover,
+.tm2 .tm2-dock-input,
+.tm2 .tm2-dock-input:focus,
+.tm2 .tm2-dock-input:hover {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  outline: none !important;
+  border-radius: 0 !important;
+  height: auto;
+}
+.tm2 .tm2-search { padding: 0 14px; background: var(--t2-c1); }
+.tm2 .tm2-search input { flex: 1; min-width: 0; padding: 11px 0 !important; font-size: .9rem; color: var(--t2-fg); }
+.tm2 .tm2-dock-input { padding: 12px 0 !important; }
+.tm2 .tm2-dock { background: var(--t2-c2); }
+
+/* While you search, the Add box steps aside instead of floating over
+   the list above the keyboard. */
+.tm2:has(.tm3-search input:focus) .tm2-dock,
+.tm2:has(.tm3-search input:focus) .tm2-hint { display: none; }
+
+/* Mobile: no shortcut hint line under the Add box (it sat off-screen) */
+.is-mobile .tm2 .tm2-hint { display: none; }
+.is-mobile .tm3-ibtn:hover { background: none; }
+
+/* Same on every device (desktop included): no shortcut hint line, and
+   one 12px side gutter instead of the pane's padding plus the view's. */
+.tm2 .tm2-hint { display: none !important; }
+.workspace-leaf-content[data-type="rabby-task-manager-view"] > .view-content {
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+}
+.tm2 { padding-left: 12px; padding-right: 12px; }
+.tm2 .tm2-dock { margin-left: 0; margin-right: 0; }
+
+/* progress: bar + small count (replaces the icon and "x/y completed") */
+.tm3-prog { display: flex; align-items: center; gap: 8px; margin-top: 9px; }
+.tm3-prog-bar { flex: 1 1 auto; min-width: 0; height: 5px; border-radius: 9px; background: var(--t2-c3); overflow: hidden; }
+.tm3-prog-fill { height: 100%; border-radius: 9px; background: var(--t2-a); transition: width .3s var(--t2-ease); }
+.tm3-prog-fill.is-done { background: var(--t2-ok); }
+.tm3-prog-n { flex: 0 0 auto; font-size: .68rem; color: var(--t2-dim); font-variant-numeric: tabular-nums; }
+.tm3-prog-lg { margin: 2px 2px 16px; }
+.tm3-prog-lg .tm3-prog-bar { height: 6px; }
+.tm3-prog-lg .tm3-prog-n { font-size: .74rem; }
