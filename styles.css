@@ -856,3 +856,12 @@ body:not(.is-mobile) .mod-right-split .tm2 {
 .tm3-prog-lg { margin: 2px 2px 16px; }
 .tm3-prog-lg .tm3-prog-bar { height: 6px; }
 .tm3-prog-lg .tm3-prog-n { font-size: .74rem; }
+
+/* project bookmarks */
+.tm3-pc-right { display: flex; align-items: center; gap: 2px; }
+.tm3-pc-bm { width: 22px; height: 24px; margin-top: -4px; display: flex; align-items: center; justify-content: center; color: var(--interactive-accent); }
+.tm3-pc-bm svg { width: 14px; height: 14px; fill: currentColor; }
+
+/* mobile keyboard: lift the Add box above it and leave room to scroll the list */
+.tm2.tm-kb-open .tm2-dock { bottom: calc(10px + var(--tm-kb, 0px)); }
+.tm2.tm-kb-open { padding-bottom: calc(96px + var(--tm-kb, 0px)); }

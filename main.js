@@ -239,7 +239,47 @@ class TaskView extends ItemView {
     this.buildChrome();
     this.registerEvent(this.app.metadataCache.on('changed', () => this.refresh()));
     this.registerEvent(this.app.vault.on('modify', () => this.refresh()));
+    const bm = this.plugin.bookmarksInstance();
+    if (bm && typeof bm.on === 'function') this.registerEvent(bm.on('changed', () => this.renderProjects()));
     await this._refresh();
+    this.watchKeyboard();
+  }
+
+  /* Mobile keyboard: Obsidian shrinks the main area for the keyboard but not
+     the sidebar drawers, so the Add box can end up under it. Measure how much
+     of this view the keyboard covers and lift the box (and pad the list) by
+     that much. Desktop has no --keyboard-height, so nothing changes there. */
+  watchKeyboard() {
+    if (!require('obsidian').Platform.isMobile) return;
+    const html = document.documentElement;
+    const update = () => {
+      const kb = parseFloat(getComputedStyle(html).getPropertyValue('--keyboard-height')) || 0;
+      let cover = 0;
+      if (kb > 0) {
+        const r = this.contentEl.getBoundingClientRect();
+        cover = Math.max(0, Math.round(r.bottom - (window.innerHeight - kb)));
+      }
+      this.root.style.setProperty('--tm-kb', cover + 'px');
+      this.root.toggleClass('tm-kb-open', cover > 0);
+    };
+    const later = () => { update(); setTimeout(update, 120); setTimeout(update, 400); };
+    const mo = new MutationObserver(later);
+    mo.observe(html, { attributes: true, attributeFilter: ['style'] });
+    this.register(() => mo.disconnect());
+    this.registerDomEvent(window, 'resize', later);
+    this.registerDomEvent(document, 'focusin', later);
+    this.registerDomEvent(document, 'focusout', later);
+    update();
+
+    /* never open the keyboard on its own: keep focus in the Add box only
+       when it was tapped (or the Quick add command asked for it) */
+    let tapped = 0;
+    this.addInput.addEventListener('pointerdown', () => { tapped = Date.now(); });
+    this.allowFocus = () => { tapped = Date.now(); };
+    this.addInput.addEventListener('focus', () => {
+      if (Date.now() - tapped > 800) this.addInput.blur();
+    });
+    if (document.activeElement === this.addInput) this.addInput.blur();
   }
 
   async onClose() { this.contentEl.empty(); }
@@ -565,9 +605,16 @@ class TaskView extends ItemView {
   renderProjects() {
     const all = this.projectStats();
     const LIMIT = 4;
+    /* projects in Obsidian's Bookmarks fill the grid (in Bookmarks order, max 4);
+       "See all" lists bookmarked first, then the rest */
+    const marks = this.plugin.bookmarkPaths();
+    const pinned = all.filter(p => marks.includes(p.file.path))
+      .sort((a, b) => marks.indexOf(a.file.path) - marks.indexOf(b.file.path));
+    const rest = all.filter(p => !marks.includes(p.file.path));
+    const shown = this.allProjects ? [...pinned, ...rest] : pinned.slice(0, LIMIT);
     this.projEl.empty();
     this.seeAllEl.empty();
-    if (all.length > LIMIT) {
+    if (this.allProjects || all.length > shown.length) {
       this.seeAllEl.createSpan({ text: this.allProjects ? 'Show less' : `See all (${all.length})` });
       setIcon(this.seeAllEl.createSpan({ cls: 'tm3-i' }), this.allProjects ? 'chevron-up' : 'chevron-right');
     }
@@ -575,17 +622,29 @@ class TaskView extends ItemView {
       this.projEl.createDiv({ cls: 'tm3-grid-empty', text: 'No projects yet. Add type: Project to a note’s properties.' });
       return;
     }
-    (this.allProjects ? all : all.slice(0, LIMIT)).forEach(p => {
-      const card = this.projEl.createDiv({ cls: 'tm3-pc' });
+    if (!shown.length) {
+      this.projEl.createDiv({ cls: 'tm3-grid-empty', text: 'No bookmarked projects. Open See all and bookmark one from its ⋯ menu.' });
+      return;
+    }
+    shown.forEach(p => {
+      const isMarked = marks.includes(p.file.path);
+      const card = this.projEl.createDiv({ cls: 'tm3-pc' + (isMarked ? ' is-bookmarked' : '') });
       const top = card.createDiv({ cls: 'tm3-pc-top' });
       setIcon(top.createDiv({ cls: 'tm3-pc-ic' }), 'folder');
-      const more = top.createDiv({ cls: 'tm3-pc-more', attr: { 'aria-label': 'More' } });
+      const right = top.createDiv({ cls: 'tm3-pc-right' });
+      if (isMarked) {
+        const bm = right.createDiv({ cls: 'tm3-pc-bm', attr: { 'aria-label': 'Bookmarked' } });
+        setIcon(bm, 'bookmark');
+      }
+      const more = right.createDiv({ cls: 'tm3-pc-more', attr: { 'aria-label': 'More' } });
       setIcon(more, 'more-horizontal');
       more.onclick = ev => {
         ev.stopPropagation();
         const m = new Menu();
         m.addItem(i => i.setTitle('Open note').setIcon('file-text')
           .onClick(() => this.app.workspace.openLinkText(p.file.path, '', false)));
+        m.addItem(i => i.setTitle(isMarked ? 'Remove bookmark' : 'Bookmark').setIcon(isMarked ? 'bookmark-minus' : 'bookmark-plus')
+          .onClick(() => { this.plugin.toggleBookmark(p.file); this.renderProjects(); }));
         m.addItem(i => i.setTitle('New tasks go here by default').setIcon('inbox')
           .setChecked(this.plugin.settings.defaultProject === p.file.basename)
           .onClick(async () => { this.plugin.settings.defaultProject = p.file.basename; await this.plugin.saveSettings(); }));
@@ -1230,6 +1289,19 @@ const DEFAULTS = { defaultProject: '' };
 module.exports = class TaskManagerPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULTS, await this.loadData());
+    /* project bookmarks now live in Obsidian's Bookmarks; move any from the
+       plugin's old private list there once, then forget the old list */
+    this.app.workspace.onLayoutReady(async () => {
+      const old = this.settings.bookmarkedProjects;
+      if (!Array.isArray(old)) return;
+      if (!this.bookmarksInstance()) return;  /* Bookmarks off: keep it for later */
+      for (const path of old) {
+        const f = this.app.vault.getAbstractFileByPath(path);
+        if (f && !this.findBookmark(path)) this.toggleBookmark(f);
+      }
+      delete this.settings.bookmarkedProjects;
+      await this.saveSettings();
+    });
 
     this.registerView(VIEW_TYPE, leaf => new TaskView(leaf, this));
 
@@ -1246,6 +1318,7 @@ module.exports = class TaskManagerPlugin extends Plugin {
       name: 'Quick add task',
       callback: async () => {
         const view = await this.activate();
+        view?.allowFocus?.();
         view?.addInput?.focus();
       },
     });
@@ -1253,6 +1326,34 @@ module.exports = class TaskManagerPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  /* ── Obsidian's Bookmarks (core plugin): one list shared with the Homepage ── */
+  bookmarksInstance() {
+    const bm = this.app.internalPlugins.getPluginById('bookmarks');
+    return bm && bm.enabled ? bm.instance : null;
+  }
+  bookmarkItems() {
+    const inst = this.bookmarksInstance();
+    if (!inst) return [];
+    const tops = (typeof inst.getBookmarks === 'function' ? inst.getBookmarks() : inst.items) || [];
+    const out = [];
+    const walk = items => { for (const i of items || []) {
+      if (i.type === 'group') walk(i.items);
+      else if (i.type === 'file' && i.path && !i.subpath) out.push(i);
+    } };
+    walk(tops);
+    return out;
+  }
+  /** note paths in Bookmarks order (groups flattened) */
+  bookmarkPaths() { return this.bookmarkItems().map(i => i.path); }
+  findBookmark(path) { return this.bookmarkItems().find(i => i.path === path) || null; }
+  toggleBookmark(file) {
+    const inst = this.bookmarksInstance();
+    if (!inst) { new Notice('Turn on the Bookmarks core plugin to bookmark projects'); return; }
+    const existing = this.findBookmark(file.path);
+    if (existing) inst.removeItem(existing);
+    else inst.addItem({ type: 'file', path: file.path, ctime: Date.now() });
   }
 
   onunload() {
