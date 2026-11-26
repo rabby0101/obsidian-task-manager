@@ -20,4 +20,4 @@ Download `main.js`, `manifest.json` and `styles.css` from the latest release int
 
 ## License
 
-MIT © Sk Fazla Rabby
+Copyright © 2026 Sk Fazla Rabby. All rights reserved. Free to install and use; copying, modifying and redistributing are not allowed. See [LICENSE](LICENSE).
